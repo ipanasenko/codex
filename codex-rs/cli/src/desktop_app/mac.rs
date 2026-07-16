@@ -17,10 +17,9 @@ pub async fn run_mac_app_open_or_install(
     let user_applications_dir = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join("Applications"));
-    if let Some(app_path) = find_existing_desktop_app_path(
-        Path::new("/Applications"),
-        user_applications_dir.as_deref(),
-    ) {
+    if let Some(app_path) =
+        find_existing_desktop_app_path(Path::new("/Applications"), user_applications_dir.as_deref())
+    {
         let app_name = app_path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -408,8 +407,7 @@ mod tests {
 
     #[test]
     fn finds_chatgpt_before_codex_across_application_directories() {
-        let temp_dir =
-            tempfile::tempdir().expect("create temporary applications directories");
+        let temp_dir = tempfile::tempdir().expect("create temporary applications directories");
         let system_applications_dir = temp_dir.path().join("system");
         let user_applications_dir = temp_dir.path().join("user");
         let system_codex_path = system_applications_dir.join("Codex.app");
@@ -418,18 +416,14 @@ mod tests {
         create_app_bundle(&user_chatgpt_path, "com.openai.codex");
 
         assert_eq!(
-            find_existing_desktop_app_path(
-                &system_applications_dir,
-                Some(&user_applications_dir),
-            ),
+            find_existing_desktop_app_path(&system_applications_dir, Some(&user_applications_dir),),
             Some(user_chatgpt_path)
         );
     }
 
     #[test]
     fn skips_classic_chatgpt_app_with_different_bundle_identifier() {
-        let temp_dir =
-            tempfile::tempdir().expect("create temporary applications directories");
+        let temp_dir = tempfile::tempdir().expect("create temporary applications directories");
         let system_applications_dir = temp_dir.path().join("system");
         let classic_chatgpt_path = system_applications_dir.join("ChatGPT.app");
         let codex_path = system_applications_dir.join("Codex.app");
