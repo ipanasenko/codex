@@ -8,20 +8,31 @@ use tokio::process::Command;
 const CODEX_DMG_URL_ARM64: &str = "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg";
 const CODEX_DMG_URL_X64: &str =
     "https://persistent.oaistatic.com/codex-app-prod/Codex-latest-x64.dmg";
+const CODEX_APP_BUNDLE_IDENTIFIER: &str = "com.openai.codex";
 
 pub async fn run_mac_app_open_or_install(
     workspace: PathBuf,
     download_url_override: Option<String>,
 ) -> anyhow::Result<()> {
-    if let Some(app_path) = find_existing_codex_app_path() {
+    let user_applications_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Applications"));
+    if let Some(app_path) = find_existing_desktop_app_path(
+        Path::new("/Applications"),
+        user_applications_dir.as_deref(),
+    ) {
+        let app_name = app_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("desktop app");
         eprintln!(
-            "Opening Codex Desktop at {app_path}...",
+            "Opening {app_name} at {app_path}...",
             app_path = app_path.display()
         );
-        open_codex_app(&app_path, &workspace).await?;
+        open_desktop_app(&app_path, &workspace).await?;
         return Ok(());
     }
-    eprintln!("Codex Desktop not found; downloading installer...");
+    eprintln!("ChatGPT or Codex Desktop not found; downloading installer...");
     let download_url = download_url_override.unwrap_or_else(|| {
         let default_url = if is_apple_silicon_mac() {
             CODEX_DMG_URL_ARM64
@@ -37,7 +48,7 @@ pub async fn run_mac_app_open_or_install(
         "Launching Codex Desktop from {installed_app}...",
         installed_app = installed_app.display()
     );
-    open_codex_app(&installed_app, &workspace).await?;
+    open_desktop_app(&installed_app, &workspace).await?;
     Ok(())
 }
 
@@ -63,21 +74,48 @@ fn is_apple_silicon_mac() -> bool {
         || macos_sysctl_flag("hw.optional.arm64").unwrap_or(false)
 }
 
-fn find_existing_codex_app_path() -> Option<PathBuf> {
-    candidate_codex_app_paths()
-        .into_iter()
-        .find(|candidate| candidate.is_dir())
-}
-
-fn candidate_codex_app_paths() -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from("/Applications/Codex.app")];
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join("Applications").join("Codex.app"));
+fn find_existing_desktop_app_path(
+    system_applications_dir: &Path,
+    user_applications_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    for app_bundle_name in ["ChatGPT.app", "Codex.app"] {
+        let system_app_path = system_applications_dir.join(app_bundle_name);
+        if is_codex_desktop_app(&system_app_path) {
+            return Some(system_app_path);
+        }
+        if let Some(user_applications_dir) = user_applications_dir {
+            let user_app_path = user_applications_dir.join(app_bundle_name);
+            if is_codex_desktop_app(&user_app_path) {
+                return Some(user_app_path);
+            }
+        }
     }
-    paths
+    None
 }
 
-async fn open_codex_app(app_path: &Path, workspace: &Path) -> anyhow::Result<()> {
+fn is_codex_desktop_app(app_path: &Path) -> bool {
+    if !app_path.is_dir() {
+        return false;
+    }
+
+    let info_plist = app_path.join("Contents/Info.plist");
+    let Ok(output) = std::process::Command::new("/usr/bin/plutil")
+        .arg("-extract")
+        .arg("CFBundleIdentifier")
+        .arg("raw")
+        .arg("-o")
+        .arg("-")
+        .arg(info_plist)
+        .output()
+    else {
+        return false;
+    };
+
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim() == CODEX_APP_BUNDLE_IDENTIFIER
+}
+
+async fn open_desktop_app(app_path: &Path, workspace: &Path) -> anyhow::Result<()> {
     eprintln!(
         "Opening workspace {workspace}...",
         workspace = workspace.display()
@@ -303,9 +341,31 @@ fn parse_hdiutil_attach_mount_point(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::codex_new_thread_url;
+    use super::find_existing_desktop_app_path;
     use super::parse_hdiutil_attach_mount_point;
     use pretty_assertions::assert_eq;
+    use std::fs;
     use std::path::Path;
+
+    fn create_app_bundle(path: &Path, bundle_identifier: &str) {
+        let contents_dir = path.join("Contents");
+        fs::create_dir_all(&contents_dir).expect("create app bundle contents directory");
+        fs::write(
+            contents_dir.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>{bundle_identifier}</string>
+</dict>
+</plist>
+"#
+            ),
+        )
+        .expect("write app bundle Info.plist");
+    }
 
     #[test]
     fn parses_mount_point_from_tab_separated_hdiutil_output() {
@@ -343,6 +403,45 @@ mod tests {
                 "/new".to_string(),
                 vec![("path".to_string(), "/tmp/codex workspace/#1".to_string())],
             )
+        );
+    }
+
+    #[test]
+    fn finds_chatgpt_before_codex_across_application_directories() {
+        let temp_dir =
+            tempfile::tempdir().expect("create temporary applications directories");
+        let system_applications_dir = temp_dir.path().join("system");
+        let user_applications_dir = temp_dir.path().join("user");
+        let system_codex_path = system_applications_dir.join("Codex.app");
+        let user_chatgpt_path = user_applications_dir.join("ChatGPT.app");
+        create_app_bundle(&system_codex_path, "com.openai.codex");
+        create_app_bundle(&user_chatgpt_path, "com.openai.codex");
+
+        assert_eq!(
+            find_existing_desktop_app_path(
+                &system_applications_dir,
+                Some(&user_applications_dir),
+            ),
+            Some(user_chatgpt_path)
+        );
+    }
+
+    #[test]
+    fn skips_classic_chatgpt_app_with_different_bundle_identifier() {
+        let temp_dir =
+            tempfile::tempdir().expect("create temporary applications directories");
+        let system_applications_dir = temp_dir.path().join("system");
+        let classic_chatgpt_path = system_applications_dir.join("ChatGPT.app");
+        let codex_path = system_applications_dir.join("Codex.app");
+        create_app_bundle(&classic_chatgpt_path, "com.openai.chat");
+        create_app_bundle(&codex_path, "com.openai.codex");
+
+        assert_eq!(
+            find_existing_desktop_app_path(
+                &system_applications_dir,
+                /*user_applications_dir*/ None,
+            ),
+            Some(codex_path)
         );
     }
 }
